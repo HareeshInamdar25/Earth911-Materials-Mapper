@@ -1,0 +1,174 @@
+import time
+import json
+import openai
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+
+# --- CONFIGURATION ---
+OPENAI_API_KEY = "sk-..."   # Replace with your API key
+openai.api_key = OPENAI_API_KEY
+
+CATEGORIES = {
+    "Electronics": [
+        "Computers, Laptops, Tablets",
+        "Monitors, TVs (CRT & Flat Screen)",
+        "Cell Phones, Smartphones",
+        "Printers, Copiers, Fax Machines",
+        "Audio/Video Equipment",
+        "Gaming Consoles",
+        "Small Appliances (Microwaves, Toasters, etc.)",
+        "Computer Peripherals (Keyboards, Mice, Cables, etc.)"
+    ],
+    "Batteries": [
+        "Household Batteries (AA, AAA, 9V, etc.)",
+        "Rechargeable Batteries",
+        "Lithium-ion Batteries",
+        "Button/Watch Batteries",
+        "Power Tool Batteries",
+        "E-bike/Scooter Batteries",
+        "Car/Automotive Batteries"
+    ],
+    "Paint & Chemicals": [
+        "Latex/Water-based Paint",
+        "Oil-based Paint and Stains",
+        "Spray Paint",
+        "Paint Thinners and Solvents",
+        "Household Cleaners",
+        "Pool Chemicals",
+        "Pesticides and Herbicides",
+        "Automotive Fluids (Oil, Antifreeze)"
+    ],
+    "Medical Sharps": [
+        "Needles and Syringes",
+        "Lancets",
+        "Auto-injectors (EpiPens)",
+        "Insulin Pens",
+        "Home Dialysis Equipment"
+    ],
+    "Textiles/Clothing": [
+        "Clothing and Shoes",
+        "Household Textiles (Towels, Bedding)",
+        "Fabric Scraps",
+        "Accessories (Belts, Bags, etc.)"
+    ],
+    "Other Important Materials": [
+        "Fluorescent Bulbs and CFLs",
+        "Mercury Thermometers",
+        "Smoke Detectors",
+        "Fire Extinguishers",
+        "Propane Tanks",
+        "Mattresses and Box Springs",
+        "Large Appliances (Fridges, Washers, etc.)",
+        "Construction Debris (Residential Quantities)"
+    ]
+}
+
+# --- LLM Prompt Function ---
+def classify_materials_llm(raw_materials: list) -> dict:
+    """
+    Use OpenAI to classify raw material strings into categories and items
+    """
+    prompt = f"""
+Given these recycling material descriptions: {raw_materials}
+Map each to:
+- a category from these: {list(CATEGORIES.keys())}
+- exact materials from this list for each category: {json.dumps(CATEGORIES, indent=2)}
+
+Output as a dict with:
+- materials_category: list of categories (group tags)
+- materials_accepted: list of exact materials matched from above
+If unsure, leave unmatched items out.
+    """
+    response = openai.ChatCompletion.create(
+        model='gpt-3.5-turbo',
+        messages=[
+            {"role": "system", "content": "You are a data assistant for mapping recycling items to structured tags."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=256
+    )
+    try:
+        structured = json.loads(response['choices'][0]['message']['content'])
+        return structured
+    except Exception:
+        # If reply is just a markdown-formatted dict string, try to fix:
+        import re
+        import ast
+        code_block = re.findall(r'``````', response['choices'][0]['message']['content'])
+        content = code_block[0] if code_block else response['choices'][0]['message']['content']
+        try:
+            return ast.literal_eval(content.strip())
+        except Exception:
+            # Fallback: Return empty structure
+            return {
+                "materials_category": [],
+                "materials_accepted": []
+            }
+
+# --- Scraping Function ---
+def scrape_earth911():
+    # SETUP SELENIUM
+    driver = webdriver.Chrome(ChromeDriverManager().install())
+    driver.get("https://search.earth911.com/")
+    time.sleep(8)  # let page load
+
+    # Input search
+    search_input = driver.find_element(By.ID, 'location-search')
+    search_input.clear()
+    search_input.send_keys("10001")
+    search_input.send_keys(Keys.ENTER)
+    time.sleep(1)
+    search_filter = driver.find_element(By.ID, 'category-search')
+    search_filter.send_keys("Electronics")
+    search_filter.send_keys(Keys.ENTER)
+    time.sleep(2)
+    # Set radius (usually in dropdown)
+    radius_button = driver.find_element(By.XPATH, "//button[contains(@aria-label,'Miles')]")
+    radius_button.click()
+    radius_100 = driver.find_element(By.XPATH, "//button[contains(text(),'100 miles')]")
+    radius_100.click()
+    time.sleep(6)
+
+    # Parse results (load first few cards)
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    results = soup.find_all('div', class_='MuiPaper-root')
+
+    facilities = []
+    for card in results[:3]:  # get top 3
+        # Business name
+        h2 = card.find('h2')
+        name = h2.get_text(strip=True) if h2 else "N/A"
+        # Street address (fetch all divs with address info)
+        addr_tag = card.find('a', href=True, string=lambda x: 'Map' in x if x else False)
+        street_addr = addr_tag.find_previous('div').get_text(strip=True) if addr_tag else "N/A"
+        # Last update
+        lu_elem = card.find(string=lambda x: 'Updated' in x if x else False)
+        last_update = lu_elem.split('Updated')[-1].strip() if lu_elem else "N/A"
+        # Materials raw listing (grab bullet/list items)
+        mats_section = card.find('ul')
+        materials_list = []
+        if mats_section:
+            materials_list = [li.get_text(strip=True) for li in mats_section.find_all('li')]
+
+        # LLM classification
+        llm_structured = classify_materials_llm(materials_list)
+        entry = {
+            "business_name": name,
+            "last_update_date": last_update,
+            "street_address": street_addr,
+            "materials_category": llm_structured.get('materials_category', []),
+            "materials_accepted": llm_structured.get('materials_accepted', [])
+        }
+        facilities.append(entry)
+
+    driver.quit()
+    return facilities
+
+if __name__ == "__main__":
+    result = scrape_earth911()
+    with open('scraped_earth911.json', 'w') as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps(result, indent=2))
